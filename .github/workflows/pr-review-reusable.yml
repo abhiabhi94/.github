@@ -1,0 +1,109 @@
+# Reusable AI pull-request review: PR-Agent (https://github.com/The-PR-Agent/pr-agent)
+# talking to OpenRouter. Call it from any repository:
+#
+#   # .github/workflows/pr-review.yml in the calling repo
+#   name: PR review
+#   on:
+#     pull_request:
+#       types: [opened, reopened, ready_for_review]
+#     issue_comment:
+#       types: [created]
+#   permissions:
+#     contents: read
+#     issues: write
+#     pull-requests: write
+#   jobs:
+#     review:
+#       uses: abhiabhi94/.github/.github/workflows/pr-review-reusable.yml@main
+#       secrets: inherit
+#
+# Requirements in the calling repo:
+#   - an `OPENROUTER_API_KEY` Actions secret (personal accounts have no shared
+#     secrets, so each repo sets its own; `secrets: inherit` passes it on);
+#   - an AGENTS.md at the repo root. PR-Agent feeds it to /review, /describe
+#     and /improve on its own (config.repo_context_files defaults to
+#     ["AGENTS.md"], read from the default branch so only merged content
+#     steers reviews). A "Code review" section there is the place for
+#     repo-specific review rules; nothing repo-specific lives in this file.
+#
+# Behaviour: on a non-draft PR being opened / reopened / marked ready for
+# review, PR-Agent runs /review (and /improve unless disabled) and posts the
+# results as PR comments and inline suggestions. It does not run on every
+# push, to keep model spend predictable; comment `/review`, `/improve`,
+# `/describe` or `/ask <question>` on the PR to run a tool on demand.
+# Bot comments and PRs from forks are skipped (forks get no secrets anyway).
+#
+# Model: `openrouter/free` by default (OpenRouter's free-model router, $0).
+# Change one caller input, or this file's default, to move to a paid model,
+# e.g. `openrouter/anthropic/claude-sonnet-4.5`; PR-Agent knows the context
+# size of OpenRouter's router models, and `custom-model-max-tokens` covers
+# any other model it does not have in its table.
+name: PR review (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      model:
+        description: PR-Agent model id (LiteLLM format). Default is OpenRouter's free router.
+        type: string
+        default: openrouter/free
+      fallback-model:
+        description: Model to retry with if the primary fails (default = the primary again).
+        type: string
+        default: ""
+      custom-model-max-tokens:
+        description: Context size assumed for models PR-Agent does not know.
+        type: string
+        default: "32000"
+      auto-improve:
+        description: Also post /improve code suggestions when a PR opens.
+        type: boolean
+        default: true
+      auto-describe:
+        description: Also rewrite the PR title/description with /describe when a PR opens.
+        type: boolean
+        default: false
+      extra-instructions:
+        description: Extra free-text instructions for /review, on top of AGENTS.md.
+        type: string
+        default: ""
+    secrets:
+      OPENROUTER_API_KEY:
+        required: true
+
+jobs:
+  review:
+    name: PR-Agent
+    if: >-
+      github.event.sender.type != 'Bot' &&
+      (
+        (github.event_name == 'pull_request' &&
+         github.event.pull_request.draft == false &&
+         github.event.pull_request.head.repo.full_name == github.repository) ||
+        (github.event_name == 'issue_comment' &&
+         github.event.issue.pull_request &&
+         startsWith(github.event.comment.body, '/'))
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      issues: write
+      pull-requests: write
+    concurrency:
+      group: pr-review-${{ github.repository }}-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: false
+    steps:
+      - name: Run PR-Agent
+        uses: the-pr-agent/pr-agent@main
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OPENROUTER.KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          CONFIG.MODEL: ${{ inputs.model }}
+          CONFIG.FALLBACK_MODELS: ${{ inputs.fallback-model || inputs.model }}
+          CONFIG.CUSTOM_MODEL_MAX_TOKENS: ${{ inputs.custom-model-max-tokens }}
+          GITHUB_ACTION_CONFIG.AUTO_REVIEW: "true"
+          GITHUB_ACTION_CONFIG.AUTO_IMPROVE: ${{ inputs.auto-improve }}
+          GITHUB_ACTION_CONFIG.AUTO_DESCRIBE: ${{ inputs.auto-describe }}
+          GITHUB_ACTION_CONFIG.FEEDBACK_ON_DRAFT_PR: "false"
+          PR_REVIEWER.EXTRA_INSTRUCTIONS: ${{ inputs.extra-instructions }}
+          PR_REVIEWER.PERSISTENT_COMMENT: "true"
