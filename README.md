@@ -46,8 +46,9 @@ jobs:
   PR description is not rewritten.
 - A comment starting with `/` on a PR runs that PR-Agent tool on demand:
   `/review`, `/improve`, `/describe`, `/ask <question>`, `/update_changelog`.
-  Use `/review` after pushing more commits; the workflow does not run on
-  every push, to keep model spend predictable.
+  Only comments from users with write access to the repo (owner, member,
+  collaborator) are honoured. Use `/review` after pushing more commits; the
+  workflow does not run on every push, to keep model spend predictable.
 - Comments from bots and PRs from forks are skipped (fork PRs get no secrets
   anyway). Do not switch the trigger to `pull_request_target` to "fix" that.
 
