@@ -1,0 +1,152 @@
+# Reusable Codex PR review. Call it from any repository:
+#
+#   # .github/workflows/codex-review.yml in the calling repo
+#   name: Codex review
+#   on:
+#     pull_request:
+#       types: [opened, ready_for_review, labeled]
+#   permissions:
+#     contents: read
+#     pull-requests: write
+#   jobs:
+#     codex:
+#       uses: abhiabhi94/.github/.github/workflows/codex-review-reusable.yml@main
+#       secrets: inherit
+#
+# Requirements in the calling repo:
+#   - an `OPENAI_API_KEY` Actions secret (personal accounts have no shared
+#     secrets, so each repo sets its own; `secrets: inherit` passes it on);
+#   - an AGENTS.md at the repo root. Codex loads it on its own, so the
+#     review is judged against that repo's guidelines. A "Code review"
+#     section there is the place for repo-specific review rules; nothing
+#     repo-specific lives in this file.
+#
+# Behaviour: runs for non-draft PRs on `opened` / `ready_for_review`, and on
+# `labeled` when the label is `inputs.label` (default `codex-review`), so a
+# PR can be re-reviewed after new pushes by re-adding the label. Codex runs
+# in the read-only permission profile and the result is posted as one PR
+# comment. openai/codex-action itself refuses actors without write access
+# to the repo, so a fork PR cannot spend the key.
+#
+name: Codex review (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      label:
+        description: Label that (re)triggers a review when added to the PR.
+        type: string
+        default: codex-review
+      model:
+        description: Model override for codex-action (empty = its default).
+        type: string
+        default: ""
+      effort:
+        description: Reasoning effort override for codex-action (empty = its default).
+        type: string
+        default: ""
+      extra-instructions:
+        description: Optional extra review instructions appended to the prompt.
+        type: string
+        default: ""
+    secrets:
+      OPENAI_API_KEY:
+        required: true
+
+jobs:
+  review:
+    name: Codex review
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.draft == false &&
+      (github.event.action != 'labeled' || github.event.label.name == inputs.label)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: codex-review-${{ github.repository }}-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    outputs:
+      review: ${{ steps.codex.outputs.final-message }}
+    steps:
+      - name: Checkout PR merge commit
+        uses: actions/checkout@v5
+        with:
+          ref: refs/pull/${{ github.event.pull_request.number }}/merge
+          persist-credentials: false
+
+      - name: Fetch base and head so Codex can diff the PR
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          git fetch --no-tags origin "$PR_BASE_REF" "+refs/pull/$PR_NUMBER/head"
+
+      - name: Check for AGENTS.md
+        run: |
+          if [ ! -f AGENTS.md ]; then
+            echo "::warning::No AGENTS.md at the repo root; Codex will review without repo guidelines."
+          fi
+
+      - name: Run Codex
+        id: codex
+        uses: openai/codex-action@v1
+        with:
+          openai-api-key: ${{ secrets.OPENAI_API_KEY }}
+          # Review only: Codex may run git/grep/cat but must not edit files.
+          permission-profile: ":read-only"
+          model: ${{ inputs.model }}
+          effort: ${{ inputs.effort }}
+          prompt: |
+            You are reviewing pull request #${{ github.event.pull_request.number }}
+            in ${{ github.repository }}.
+
+            The repository guidelines are in AGENTS.md (already loaded). If it
+            has a "Code review" section, follow it for what to check and how
+            to report; otherwise check the change against the rest of the
+            file and report a short verdict followed by findings ordered by
+            severity, each with path:line, what is wrong, and a concrete fix,
+            separating blockers from suggestions.
+
+            Review ONLY the changes this PR introduces:
+
+                git diff ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+                git log --oneline ${{ github.event.pull_request.base.sha }}...${{ github.event.pull_request.head.sha }}
+
+            Read surrounding code when you need context, but do not comment
+            on code the PR does not touch. Do not modify any files.
+
+            Write the review in GitHub-flavoured Markdown, starting with the
+            heading "## Codex review". Be concise and specific.
+
+            ${{ inputs.extra-instructions }}
+
+            Pull request title and body:
+            ----
+            ${{ github.event.pull_request.title }}
+            ${{ github.event.pull_request.body }}
+
+  comment:
+    name: Post review
+    runs-on: ubuntu-latest
+    needs: review
+    if: needs.review.outputs.review != ''
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Post Codex review as a PR comment
+        uses: actions/github-script@v7
+        env:
+          CODEX_REVIEW: ${{ needs.review.outputs.review }}
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            const body = process.env.CODEX_REVIEW.trim() +
+              `\n\n---\n_Automated review by OpenAI Codex ` +
+              `([run](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}))._`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body,
+            });
